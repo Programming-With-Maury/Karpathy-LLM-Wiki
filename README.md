@@ -4,6 +4,10 @@ This repository is a practical scaffold for the "LLM-maintained wiki" pattern de
 
 <https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f>
 
+This is my personal LLM Wiki setup, where I use this workflow to manage and grow knowledge across my own projects.
+
+![Personal LLM Wiki screenshot](image.png)
+
 The model is simple:
 
 - `raw/` contains immutable source material.
