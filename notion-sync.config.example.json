@@ -1,0 +1,8 @@
+{
+  "workspace": "default",
+  "queue_ingest": true,
+  "overlap_seconds": 120,
+  "max_pages_per_run": 500,
+  "databases": [],
+  "pages": []
+}
