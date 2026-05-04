@@ -14,6 +14,7 @@ import posixpath
 import queue
 import re
 import socket
+import shutil
 import ssl
 import subprocess
 import threading
@@ -42,6 +43,8 @@ CURRENT_WORKSPACE = DEFAULT_WORKSPACE
 WIKI_ROOT = ROOT / "wiki"
 RAW_ROOT = ROOT / "raw"
 RAW_SOURCES = RAW_ROOT / "sources"
+DOMAINS_ROOT = WIKI_ROOT / "domains"
+GLOBAL_ROOT = WIKI_ROOT / "global"
 LOG_PATH = WIKI_ROOT / "log.md"
 INDEX_PATH = WIKI_ROOT / "index.md"
 REVISIONS_ROOT = WIKI_ROOT / "revisions"
@@ -51,6 +54,7 @@ STATUS_PATH = ROOT / ".ingestion-status.json"
 BATCHES_ROOT = ROOT / ".batches"
 REVIEW_STATE_PATH = ROOT / ".review-state.json"
 CHAT_STATE_PATH = ROOT / ".chat-state.json"
+DOMAIN_CONFIDENCE_THRESHOLD = 0.62
 STATUS_LOCK = threading.Lock()
 BATCH_LOCK = threading.Lock()
 CHAT_LOCK = threading.Lock()
@@ -60,6 +64,8 @@ WORKER_STARTED = False
 
 SECTIONS = {
     "overview": "Overview",
+    "domains": "Domains",
+    "global": "Global Knowledge",
     "sources": "AI Source Pages",
     "entities": "Entities",
     "concepts": "Concepts",
@@ -81,13 +87,15 @@ def workspace_root(name: str) -> Path:
 
 
 def configure_workspace(name: str) -> str:
-    global CURRENT_WORKSPACE, WIKI_ROOT, RAW_ROOT, RAW_SOURCES, LOG_PATH, INDEX_PATH, REVISIONS_ROOT, ARCHIVE_ROOT, STAGING_ROOT, STATUS_PATH, BATCHES_ROOT, REVIEW_STATE_PATH, CHAT_STATE_PATH
+    global CURRENT_WORKSPACE, WIKI_ROOT, RAW_ROOT, RAW_SOURCES, DOMAINS_ROOT, GLOBAL_ROOT, LOG_PATH, INDEX_PATH, REVISIONS_ROOT, ARCHIVE_ROOT, STAGING_ROOT, STATUS_PATH, BATCHES_ROOT, REVIEW_STATE_PATH, CHAT_STATE_PATH
     normalized = workspace_slug(name)
     root = workspace_root(normalized)
     CURRENT_WORKSPACE = normalized
     WIKI_ROOT = root / "wiki"
     RAW_ROOT = root / "raw"
     RAW_SOURCES = RAW_ROOT / "sources"
+    DOMAINS_ROOT = WIKI_ROOT / "domains"
+    GLOBAL_ROOT = WIKI_ROOT / "global"
     LOG_PATH = WIKI_ROOT / "log.md"
     INDEX_PATH = WIKI_ROOT / "index.md"
     REVISIONS_ROOT = WIKI_ROOT / "revisions"
@@ -141,12 +149,16 @@ def initialize_workspace_files(name: str) -> None:
     templates_root = wiki_root / "templates"
     (raw_root / "sources").mkdir(parents=True, exist_ok=True)
     (raw_root / "assets").mkdir(parents=True, exist_ok=True)
+    (wiki_root / "domains").mkdir(parents=True, exist_ok=True)
+    (wiki_root / "global" / "entities").mkdir(parents=True, exist_ok=True)
+    (wiki_root / "global" / "concepts").mkdir(parents=True, exist_ok=True)
     (wiki_root / "sources").mkdir(parents=True, exist_ok=True)
     (wiki_root / "entities").mkdir(parents=True, exist_ok=True)
     (wiki_root / "concepts").mkdir(parents=True, exist_ok=True)
     (wiki_root / "queries").mkdir(parents=True, exist_ok=True)
     (wiki_root / "revisions").mkdir(parents=True, exist_ok=True)
     (wiki_root / "staging" / "sources").mkdir(parents=True, exist_ok=True)
+    (wiki_root / "staging" / "domain-review").mkdir(parents=True, exist_ok=True)
     (wiki_root / "archive" / "entities").mkdir(parents=True, exist_ok=True)
     (wiki_root / "archive" / "concepts").mkdir(parents=True, exist_ok=True)
     (root / ".batches").mkdir(parents=True, exist_ok=True)
@@ -163,12 +175,15 @@ def initialize_workspace_files(name: str) -> None:
         wiki_root / "index.md": "# Index\n\nThis workspace is empty. Upload source material to begin building the wiki.\n",
         wiki_root / "log.md": "# Log\n\n- Workspace initialized.\n",
         wiki_root / "overview.md": "# Overview\n\nThis workspace is currently empty.\n",
+        wiki_root / "domains" / "README.md": "# Domains\n\nAuto-detected domain wikis are written here.\n",
+        wiki_root / "global" / "README.md": "# Global Knowledge\n\nOnly concepts and entities reused across multiple domains belong here.\n",
         wiki_root / "queries" / "README.md": "# Queries\n\nDurable query artifacts and review outputs are written here.\n",
         wiki_root / "sources" / "README.md": "# Sources\n\nAI-generated source summaries are written here after ingest.\n",
         wiki_root / "entities" / "README.md": "# Entities\n\nAI-maintained entity pages are written here.\n",
         wiki_root / "concepts" / "README.md": "# Concepts\n\nAI-maintained concept pages are written here.\n",
         wiki_root / "staging" / "README.md": "# Staging\n\nSources that need review before active promotion are written here.\n",
         wiki_root / "staging" / "sources" / "README.md": "# Staged Sources\n\nPer-source intake assessments and held drafts are written here.\n",
+        wiki_root / "staging" / "domain-review" / "README.md": "# Domain Review\n\nSources with uncertain domain classification are held here.\n",
         raw_root / "README.md": "# Raw Sources\n\nImmutable uploaded source material lives here.\n",
         raw_root / "assets" / ".gitkeep": "",
         root / ".ingestion-status.json": json.dumps({"status": "idle", "queued_jobs": 0, "current_batch": None, "phase": "idle", "current_file": None, "last_event": "Workspace initialized.", "recent_events": []}),
@@ -900,6 +915,28 @@ class Page:
     def archived(self) -> bool:
         return self.rel_path.startswith("archive/")
 
+    @property
+    def domain(self) -> str:
+        parts = self.rel_path.split("/")
+        if len(parts) >= 2 and parts[0] == "domains":
+            return parts[1]
+        if parts and parts[0] == "global":
+            return "global"
+        return ""
+
+    @property
+    def kind(self) -> str:
+        parts = self.rel_path.split("/")
+        if len(parts) >= 3 and parts[0] == "domains":
+            return {"sources": "source", "entities": "entity", "concepts": "concept", "queries": "query"}.get(parts[2], parts[2])
+        if len(parts) >= 2 and parts[0] == "global":
+            return {"entities": "entity", "concepts": "concept", "queries": "query"}.get(parts[1], parts[1])
+        if parts[0] in {"sources", "entities", "concepts", "queries"}:
+            return {"sources": "source", "entities": "entity", "concepts": "concept", "queries": "query"}[parts[0]]
+        if self.rel_path.endswith("overview.md"):
+            return "overview"
+        return self.section.removesuffix("s")
+
 
 @dataclass
 class VertexConfig:
@@ -1297,8 +1334,14 @@ def is_archived_stub(path: Path) -> bool:
 
 def extract_summary(path: Path) -> str:
     try:
+        in_frontmatter = False
         for line in path.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
+            if stripped == "---":
+                in_frontmatter = not in_frontmatter
+                continue
+            if in_frontmatter:
+                continue
             if not stripped or stripped.startswith("#") or stripped.startswith("-") or stripped.startswith("```"):
                 continue
             return stripped[:180]
@@ -1472,10 +1515,11 @@ def repository_stats() -> dict[str, int]:
         "wiki_pages": len(wiki_pages),
         "staging_pages": len(staging_pages),
         "raw_files": len(raw_files),
-        "sources": len([p for p in wiki_pages if p.section == "sources"]),
-        "entities": len([p for p in wiki_pages if p.section == "entities"]),
-        "concepts": len([p for p in wiki_pages if p.section == "concepts"]),
-        "queries": len([p for p in wiki_pages if p.section == "queries"]),
+        "domains": len(scan_domains()),
+        "sources": len([p for p in wiki_pages if p.kind == "source"]),
+        "entities": len([p for p in wiki_pages if p.kind == "entity"]),
+        "concepts": len([p for p in wiki_pages if p.kind == "concept"]),
+        "queries": len([p for p in wiki_pages if p.kind == "query"]),
         "revisions": len(revisions),
     }
 
@@ -1488,6 +1532,111 @@ def ensure_directories() -> None:
 def slugify(text: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
     return slug or "untitled"
+
+
+def wiki_rel_link(from_rel_path: str, to_rel_path: str) -> str:
+    return os.path.relpath(WIKI_ROOT / to_rel_path, (WIKI_ROOT / from_rel_path).parent).replace(os.sep, "/")
+
+
+def domain_root(domain_slug: str) -> Path:
+    return DOMAINS_ROOT / slugify(domain_slug)
+
+
+def domain_rel(domain_slug: str, *parts: str) -> str:
+    return "/".join(["domains", slugify(domain_slug), *parts])
+
+
+def domain_from_rel_path(rel_path: str) -> str:
+    parts = rel_path.split("/")
+    if len(parts) >= 2 and parts[0] == "domains":
+        return parts[1]
+    return ""
+
+
+def domain_title_from_slug(slug: str) -> str:
+    return slug.replace("-", " ").title()
+
+
+def domain_overview_rel(domain_slug: str) -> str:
+    return domain_rel(domain_slug, "overview.md")
+
+
+def scan_domains() -> list[dict[str, str]]:
+    domains: list[dict[str, str]] = []
+    if not DOMAINS_ROOT.exists():
+        return domains
+    for path in sorted(DOMAINS_ROOT.iterdir()):
+        if not path.is_dir():
+            continue
+        overview = path / "overview.md"
+        title = extract_title(overview) if overview.exists() else domain_title_from_slug(path.name)
+        summary = extract_summary(overview) if overview.exists() else "No summary yet."
+        domains.append({"slug": path.name, "title": title, "summary": summary})
+    return domains
+
+
+def ensure_domain(domain_slug: str, title: str = "", reason: str = "") -> str:
+    slug = slugify(domain_slug or title)
+    root = domain_root(slug)
+    for child in ["sources", "entities", "concepts", "queries"]:
+        (root / child).mkdir(parents=True, exist_ok=True)
+    overview = root / "overview.md"
+    if not overview.exists():
+        display_title = title.strip() or domain_title_from_slug(slug)
+        content = f"""---
+tags: [domain]
+domain: {slug}
+status: active
+---
+
+# {display_title}
+
+## Summary
+
+Domain workspace for {display_title}. {reason.strip() or "This page will accumulate the domain-level synthesis as sources are ingested."}
+
+## Key Points
+
+- No domain synthesis yet.
+
+## Evidence / Notes
+
+- Domain created on {dt.date.today().isoformat()}.
+
+## Links
+
+- [Sources](sources/README.md)
+- [Entities](entities/README.md)
+- [Concepts](concepts/README.md)
+- [Queries](queries/README.md)
+
+## Open Questions
+
+- What are the strongest recurring claims and decisions in this domain?
+"""
+        overview.write_text(content, encoding="utf-8")
+    defaults = {
+        root / "sources" / "README.md": f"# {domain_title_from_slug(slug)} Sources\n\nSource summaries for this domain.\n",
+        root / "entities" / "README.md": f"# {domain_title_from_slug(slug)} Entities\n\nEntities specific to this domain.\n",
+        root / "concepts" / "README.md": f"# {domain_title_from_slug(slug)} Concepts\n\nConcepts specific to this domain.\n",
+        root / "queries" / "README.md": f"# {domain_title_from_slug(slug)} Queries\n\nDurable query artifacts for this domain.\n",
+    }
+    for path, content in defaults.items():
+        if not path.exists():
+            path.write_text(content, encoding="utf-8")
+    return slug
+
+
+def domain_metadata_from_result(result: dict[str, object]) -> dict[str, object]:
+    slug = slugify(str(result.get("domain_slug", "")).strip() or str(result.get("domain_title", "")).strip())
+    return {
+        "domain_slug": slug,
+        "domain_title": str(result.get("domain_title", "")).strip() or domain_title_from_slug(slug),
+        "confidence": float(result.get("confidence", 0.0) or 0.0),
+        "reason": str(result.get("reason", "")).strip(),
+        "new_domain": bool(result.get("new_domain", False)),
+        "cross_domain_candidates": sanitize_list(result.get("cross_domain_candidates", [])),
+    }
 
 
 def derive_title_from_raw(path: Path) -> str:
@@ -1537,9 +1686,14 @@ def upsert_index_entry(section: str, rel_path: str, description: str) -> None:
 
 def rebuild_index_page() -> str:
     pages = scan_wiki_pages()
-    grouped: dict[str, list[Page]] = {"overview": [], "sources": [], "entities": [], "concepts": [], "queries": []}
-    for page in pages:
-        grouped.setdefault(page.section, []).append(page)
+    domains = scan_domains()
+    global_entities = [page for page in pages if page.rel_path.startswith("global/entities/")]
+    global_concepts = [page for page in pages if page.rel_path.startswith("global/concepts/")]
+    recent_queries = [
+        page for page in pages
+        if page.rel_path.startswith("queries/") or "/queries/" in page.rel_path
+    ]
+    staging_pages = scan_staging_pages()
 
     def render_section(header: str, items: list[Page]) -> str:
         if not items:
@@ -1553,21 +1707,80 @@ def rebuild_index_page() -> str:
         )
         return f"## {header}\n\n{rows}\n"
 
+    domain_rows = []
+    for domain in domains:
+        slug = domain["slug"]
+        domain_pages = [page for page in pages if page.rel_path.startswith(f"domains/{slug}/")]
+        source_count = len([page for page in domain_pages if "/sources/" in page.rel_path])
+        concept_count = len([page for page in domain_pages if "/concepts/" in page.rel_path])
+        entity_count = len([page for page in domain_pages if "/entities/" in page.rel_path])
+        domain_rows.append(
+            f"- [domains/{slug}/overview.md](domains/{slug}/overview.md) - {domain['summary']} "
+            f"({source_count} sources, {entity_count} entities, {concept_count} concepts)"
+        )
+    domains_md = "\n".join(domain_rows) or "- None yet."
+    staging_md = "\n".join(
+        f"- [{page.rel_path}]({page.rel_path}) - {page.summary or 'Staged for review.'}"
+        for page in sorted(staging_pages, key=lambda item: item.rel_path)
+    ) or "- None yet."
+
     content = "\n".join(
         [
             "# Index",
             "",
-            "This index is rebuilt from the current AI-managed wiki state.",
+            "This index is rebuilt from the current domain-aware wiki state.",
             "",
-            render_section("Overview", grouped.get("overview", [])),
-            render_section("Sources", grouped.get("sources", [])),
-            render_section("Entities", grouped.get("entities", [])),
-            render_section("Concepts", grouped.get("concepts", [])),
-            render_section("Queries", grouped.get("queries", [])),
+            "## Overview",
+            "",
+            "- [overview.md](overview.md) - Compact map of all active domains.",
+            "",
+            "## Domains",
+            "",
+            domains_md,
+            "",
+            render_section("Global Concepts", global_concepts),
+            render_section("Global Entities", global_entities),
+            render_section("Recent Queries", sorted(recent_queries, key=lambda item: item.path.stat().st_mtime, reverse=True)[:20]),
+            "## Staging",
+            "",
+            staging_md,
         ]
     ).strip() + "\n"
     INDEX_PATH.write_text(content, encoding="utf-8")
     return "index.md"
+
+
+def rebuild_root_overview() -> str:
+    domains = scan_domains()
+    domain_rows = "\n".join(
+        f"- [{domain['title']}](domains/{domain['slug']}/overview.md): {domain['summary']}"
+        for domain in domains
+    ) or "- No active domains yet."
+    content = f"""---
+tags: [overview]
+status: active
+---
+
+# Overview
+
+This wiki is organized as a domain-aware Karpathy LLM Wiki. Raw uploads remain in `raw/`, while durable synthesis is compiled into domain folders under `wiki/domains/`.
+
+## Domains
+
+{domain_rows}
+
+## Global Knowledge
+
+- [Global concepts](global/concepts/README.md) are reserved for concepts reused across multiple domains.
+- [Global entities](global/entities/README.md) are reserved for entities reused across multiple domains.
+
+## Staging
+
+- [Domain review](staging/domain-review/README.md) holds sources whose domain classification is uncertain.
+- [Source staging](staging/sources/README.md) holds sources with weak or partial extraction.
+"""
+    (WIKI_ROOT / "overview.md").write_text(content, encoding="utf-8")
+    return "overview.md"
 
 
 def append_log(operation: str, title: str, summary: str, pages: list[str]) -> None:
@@ -1820,12 +2033,14 @@ def extract_json_text(path: Path) -> str:
 
 def vertex_generate_structured_summary(
     config: VertexConfig,
+    *,
     title: str,
     raw_path: Path,
     raw_text: str,
-    *,
     workbook_info: dict[str, object] | None = None,
     source_profile: dict[str, object] | None = None,
+    existing_entities: list[str] | None = None,
+    existing_concepts: list[str] | None = None,
 ) -> dict[str, object]:
     source_profile = source_profile or {}
     workbook_section = ""
@@ -1889,6 +2104,12 @@ def vertex_generate_structured_summary(
         - Keep claims grounded in the source.
         - If information is absent, use an empty list.
         - Keep each list item short.
+        - Quality over quantity: Extract ONLY highly specific, domain-central entities and concepts. Do NOT extract generic terms (e.g., "Company", "Software", "Data").
+        - IMPORTANT: Try to map findings to the following existing Entities or Concepts instead of creating new ones if they are conceptually identical. Only create new ones if they represent a truly novel and important domain specific idea.
+        - Existing Entities: {", ".join(existing_entities) if existing_entities else "None"}
+        - Existing Concepts: {", ".join(existing_concepts) if existing_concepts else "None"}
+        - If an entity or concept is not critical to understanding the core thesis of the source, omit it entirely.
+        - Ensure that the summaries and facts are highly actionable and explain the exact relevance to the domain.
         - The source classification and extraction quality are part of the context. Adjust your output to them.
         - If the source is a workbook, cover the whole workbook, not just the first sheet.
         - Prefer describing major sheets and their role over inventing random entities.
@@ -1922,6 +2143,61 @@ def vertex_generate_structured_summary(
     body = vertex_request_json(config, payload, label="Structured ingest summary", timeout=120, retries=2)
     text = extract_vertex_text(body, error_message="Vertex returned no candidates.")
     return parse_vertex_json_text(text)
+
+
+def vertex_classify_source_domain(
+    config: VertexConfig,
+    *,
+    title: str,
+    raw_path: Path,
+    raw_text: str,
+    source_profile: dict[str, object],
+) -> dict[str, object]:
+    domains = scan_domains()
+    domain_context = "\n".join(
+        f"- {item['slug']}: {item['title']} - {item['summary']}"
+        for item in domains
+    ) or "- None yet."
+    prompt = textwrap.dedent(
+        f"""
+        You are routing an uploaded source into a domain-aware LLM wiki.
+        Return valid JSON only with this exact schema:
+        {{
+          "domain_slug": "lowercase-kebab-domain",
+          "domain_title": "Human Domain Title",
+          "confidence": 0.0,
+          "reason": "short reason",
+          "new_domain": false,
+          "cross_domain_candidates": ["other-domain"]
+        }}
+
+        Rules:
+        - Prefer an existing domain if the source clearly belongs there.
+        - Create a new domain only if the source is clearly a different durable project/topic.
+        - Use confidence 0.80+ only when the domain choice is obvious.
+        - Use confidence below {DOMAIN_CONFIDENCE_THRESHOLD} when the source spans multiple domains or the destination is ambiguous.
+        - Do not use generic domains like "general", "misc", or "notes".
+        - Domain slugs must be lowercase kebab-case.
+
+        Existing domains:
+        {domain_context}
+
+        Source title: {title}
+        Source repo path: {raw_path.relative_to(ROOT).as_posix()}
+        Source type: {source_profile.get('source_type_label', 'Unknown')}
+        Extraction quality: {source_profile.get('quality_label', 'unknown')}
+
+        Source excerpt:
+        {raw_text[:9000]}
+        """
+    ).strip()
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
+    }
+    body = vertex_request_json(config, payload, label="Domain classifier", timeout=90, retries=2)
+    text = extract_vertex_text(body, error_message="Vertex returned no domain classification.")
+    return domain_metadata_from_result(parse_vertex_json_text(text))
 
 
 def vertex_rewrite_markdown_page(
@@ -1998,8 +2274,9 @@ def vertex_rewrite_markdown_page(
     return text
 
 
-def repair_internal_links(page_rel_path: str, markdown: str) -> str:
+def repair_internal_links(page_rel_path: str, markdown: str, pending_slugs: set[str] | None = None) -> str:
     current_dir = Path(page_rel_path).parent
+    pending = pending_slugs or set()
 
     def replace_link(match: re.Match[str]) -> str:
         label = match.group(1)
@@ -2012,17 +2289,38 @@ def repair_internal_links(page_rel_path: str, markdown: str) -> str:
             return match.group(0)
 
         slug = Path(target).stem
+        if slug in pending:
+            domain_slug = domain_from_rel_path(page_rel_path)
+            if "entities" in target:
+                candidate = WIKI_ROOT / (domain_rel(domain_slug, "entities", f"{slug}.md") if domain_slug else f"entities/{slug}.md")
+                rel = os.path.relpath(candidate, (WIKI_ROOT / page_rel_path).parent).replace(os.sep, "/")
+                return f"[{label}]({rel})"
+            elif "concepts" in target:
+                candidate = WIKI_ROOT / (domain_rel(domain_slug, "concepts", f"{slug}.md") if domain_slug else f"concepts/{slug}.md")
+                rel = os.path.relpath(candidate, (WIKI_ROOT / page_rel_path).parent).replace(os.sep, "/")
+                return f"[{label}]({rel})"
+            return match.group(0)
+
+        domain_slug = domain_from_rel_path(page_rel_path)
         alternatives = [
+            *((
+                WIKI_ROOT / domain_rel(domain_slug, "entities", f"{slug}.md"),
+                WIKI_ROOT / domain_rel(domain_slug, "concepts", f"{slug}.md"),
+                WIKI_ROOT / domain_rel(domain_slug, "sources", f"{slug}.md"),
+                WIKI_ROOT / domain_rel(domain_slug, "queries", f"{slug}.md"),
+            ) if domain_slug else ()),
+            WIKI_ROOT / "global" / "entities" / f"{slug}.md",
+            WIKI_ROOT / "global" / "concepts" / f"{slug}.md",
+            WIKI_ROOT / "queries" / f"{slug}.md",
             WIKI_ROOT / "entities" / f"{slug}.md",
             WIKI_ROOT / "concepts" / f"{slug}.md",
             WIKI_ROOT / "sources" / f"{slug}.md",
-            WIKI_ROOT / "queries" / f"{slug}.md",
         ]
         for alt in alternatives:
             if alt.exists():
                 rel = os.path.relpath(alt, (WIKI_ROOT / page_rel_path).parent).replace(os.sep, "/")
                 return f"[{label}]({rel})"
-        return match.group(0)
+        return label  # Strip broken link
 
     return re.sub(r"\[([^\]]+)\]\(([^)]+)\)", replace_link, markdown)
 
@@ -2033,10 +2331,12 @@ def write_staging_source_page(
     source_profile: dict[str, object],
     source_data: dict[str, object] | None = None,
     promoted_page_rel: str = "",
+    domain_meta: dict[str, object] | None = None,
+    domain_review: bool = False,
 ) -> str:
     raw_path = RAW_ROOT / raw_rel_path
     title = derive_title_from_raw(raw_path)
-    rel_path = f"staging/sources/{slugify(raw_path.stem)}.md"
+    rel_path = f"staging/{'domain-review' if domain_review else 'sources'}/{slugify(raw_path.stem)}.md"
     summary = ""
     if isinstance(source_data, dict):
         summary = str(source_data.get("summary", "")).strip()
@@ -2044,8 +2344,22 @@ def write_staging_source_page(
         summary = local_source_snapshot(read_text_file(raw_path, for_ingest=True))
     decision = str(source_profile.get("decision", "hold")).strip() or "hold"
     promoted_md = f"- Active page: [../../{promoted_page_rel}](../../{promoted_page_rel})" if promoted_page_rel else "- Active page: Not promoted yet."
-    content = f"""# {title} Intake Assessment
+    domain_meta = domain_meta or {}
+    domain_slug = str(domain_meta.get("domain_slug", "")).strip()
+    domain_confidence = domain_meta.get("confidence", "")
+    domain_reason = str(domain_meta.get("reason", "")).strip() or "Not classified yet."
+    content = f"""---
+tags: [staging, source]
+domain: {domain_slug or "unclassified"}
+domain_confidence: {domain_confidence if domain_confidence != "" else "unknown"}
+domain_reason: "{domain_reason.replace('"', "'")}"
+shared_scope: domain
+source_paths: ["../../raw/{raw_rel_path}"]
+status: staged
+---
 
+# {title} Intake Assessment
+ 
 ## Summary
 
 {summary}
@@ -2056,6 +2370,9 @@ def write_staging_source_page(
 - Source type: {source_profile.get('source_type_label', 'Unknown')}
 - Extraction quality: {source_profile.get('quality_label', 'unknown')}
 - Decision: {decision}
+- Domain: {domain_slug or 'unclassified'}
+- Domain confidence: {domain_confidence if domain_confidence != '' else 'unknown'}
+- Domain reason: {domain_reason}
 - Ingested: {dt.date.today().isoformat()}
 
 ## Decision Notes
@@ -2077,6 +2394,8 @@ def write_ai_source_page(
     raw_rel_path: str,
     source_data: dict[str, object],
     *,
+    domain_slug: str,
+    domain_meta: dict[str, object] | None = None,
     sheet_page_links: list[str] | None = None,
     source_profile: dict[str, object] | None = None,
     staging_page_rel: str = "",
@@ -2084,9 +2403,12 @@ def write_ai_source_page(
     raw_path = RAW_ROOT / raw_rel_path
     title = derive_title_from_raw(raw_path)
     slug = slugify(raw_path.stem)
-    wiki_rel_path = f"sources/{slug}.md"
+    domain_slug = ensure_domain(domain_slug, str((domain_meta or {}).get("domain_title", "")), str((domain_meta or {}).get("reason", "")))
+    wiki_rel_path = domain_rel(domain_slug, "sources", f"{slug}.md")
     wiki_path = WIKI_ROOT / wiki_rel_path
+    wiki_path.parent.mkdir(parents=True, exist_ok=True)
     source_profile = source_profile or {}
+    domain_meta = domain_meta or {}
 
     summary = str(source_data.get("summary", "")).strip() or "AI-generated source summary."
     key_points = [str(item).strip() for item in source_data.get("key_points", []) if str(item).strip()]
@@ -2123,7 +2445,17 @@ def write_ai_source_page(
         if isinstance(item, dict) and str(item.get("name", "")).strip()
     ) or "- No sheet-level breakdown captured."
 
-    content = f"""# {title}
+    content = f"""---
+tags: [source]
+domain: {domain_slug}
+domain_confidence: {domain_meta.get('confidence', 'unknown')}
+domain_reason: "{str(domain_meta.get('reason', '')).replace('"', "'")}"
+shared_scope: domain
+source_paths: ["../../../../raw/{raw_rel_path}"]
+status: active
+---
+
+# {title}
 
 ## Summary
 
@@ -2134,10 +2466,12 @@ def write_ai_source_page(
 - Raw path: ../../raw/{raw_rel_path}
 - Source type: {source_profile.get('source_type_label', 'Unknown')}
 - Extraction quality: {source_profile.get('quality_label', 'unknown')}
+- Domain: {domain_slug}
+- Domain confidence: {domain_meta.get('confidence', 'unknown')}
 - Author:
 - Published:
 - Ingested: {dt.date.today().isoformat()}
-- Intake assessment: {'[../' + staging_page_rel + '](../' + staging_page_rel + ')' if staging_page_rel else 'None'}
+- Intake assessment: {'[' + staging_page_rel + '](' + wiki_rel_link(wiki_rel_path, staging_page_rel) + ')' if staging_page_rel else 'None'}
 
 ## Key Points
 
@@ -2172,7 +2506,7 @@ def write_ai_source_page(
 {questions_md}
 """
     wiki_path.write_text(content, encoding="utf-8")
-    update_index_for_source(wiki_rel_path, summary)
+    rebuild_index_page()
     return wiki_rel_path
 
 
@@ -2182,6 +2516,8 @@ def write_workbook_sheet_pages(
     source_title: str,
     workbook_info: dict[str, object],
     source_data: dict[str, object],
+    *,
+    domain_slug: str,
 ) -> list[str]:
     sheets = workbook_info.get("sheets", [])
     if not isinstance(sheets, list) or not sheets:
@@ -2198,6 +2534,7 @@ def write_workbook_sheet_pages(
 
     raw_path = RAW_ROOT / raw_rel_path
     workbook_slug = slugify(raw_path.stem)
+    domain_slug = ensure_domain(domain_slug)
     touched: list[str] = []
     for sheet in sheets[:24]:
         if not isinstance(sheet, dict):
@@ -2205,8 +2542,9 @@ def write_workbook_sheet_pages(
         sheet_name = str(sheet.get("name", "")).strip()
         if not sheet_name:
             continue
-        rel_path = f"sources/{workbook_slug}-{slugify(sheet_name)}.md"
+        rel_path = domain_rel(domain_slug, "sources", f"{workbook_slug}-{slugify(sheet_name)}.md")
         path = WIKI_ROOT / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
         item = summary_map.get(sheet_name, {})
         summary = str(item.get("summary", "")).strip() or f"Sheet from workbook {source_title}."
         highlights = sanitize_list(item.get("highlights", []))
@@ -2215,7 +2553,15 @@ def write_workbook_sheet_pages(
         highlights_md = "\n".join(f"- {point}" for point in highlights[:8]) or "- No highlights captured."
         columns = sheet.get("columns", [])
         columns_md = ", ".join(str(col) for col in columns[:20]) or "None."
-        content = f"""# {source_title} · {sheet_name}
+        content = f"""---
+tags: [source, workbook-sheet]
+domain: {domain_slug}
+shared_scope: domain
+source_paths: ["../../../../raw/{raw_rel_path}"]
+status: active
+---
+
+# {source_title} · {sheet_name}
 
 ## Summary
 
@@ -2223,8 +2569,8 @@ def write_workbook_sheet_pages(
 
 ## Source Metadata
 
-Raw workbook path: ../../raw/{raw_rel_path}
-Parent source page: [../{source_page_rel}](../{source_page_rel})
+Raw workbook path: ../../../../raw/{raw_rel_path}
+Parent source page: [{source_page_rel}]({wiki_rel_link(rel_path, source_page_rel)})
 Sheet name: {sheet_name}
 Row count: {sheet.get("row_count", 0)}
 Column count: {sheet.get("column_count", 0)}
@@ -2241,7 +2587,7 @@ Ingested: {dt.date.today().isoformat()}
 
 ## Links
 
-- [{source_title}](../{source_page_rel})
+- [{source_title}]({wiki_rel_link(rel_path, source_page_rel)})
 - [overview](../overview.md)
 
 ## Open Questions
@@ -2249,15 +2595,29 @@ Ingested: {dt.date.today().isoformat()}
 - None yet.
 """
         path.write_text(content, encoding="utf-8")
-        upsert_index_entry("Sources", rel_path, summary)
         touched.append(rel_path)
     return touched
 
 
-def upsert_knowledge_page(section: str, item: dict[str, object], source_page_rel: str, source_title: str) -> str:
+def upsert_knowledge_page(
+    section: str,
+    item: dict[str, object],
+    source_page_rel: str,
+    source_title: str,
+    pending_slugs: set[str] | None = None,
+    *,
+    domain_slug: str = "",
+    shared_scope: str = "domain",
+) -> str:
+    pending = pending_slugs or set()
     slug = slugify(str(item["name"]))
-    rel_path = f"{section}/{slug}.md"
+    if shared_scope == "global":
+        rel_path = f"global/{section}/{slug}.md"
+    else:
+        domain_slug = ensure_domain(domain_slug or domain_from_rel_path(source_page_rel) or "unclassified")
+        rel_path = domain_rel(domain_slug, section, f"{slug}.md")
     path = WIKI_ROOT / rel_path
+    path.parent.mkdir(parents=True, exist_ok=True)
     title = str(item["name"]).strip()
     summary = str(item.get("summary", "")).strip() or f"AI-maintained {section[:-1]} page."
     facts = sanitize_list(item.get("facts", []))
@@ -2267,18 +2627,27 @@ def upsert_knowledge_page(section: str, item: dict[str, object], source_page_rel
     link_lines = []
     for link in links:
         link_slug = slugify(link)
-        entity_candidate = WIKI_ROOT / "entities" / f"{link_slug}.md"
-        concept_candidate = WIKI_ROOT / "concepts" / f"{link_slug}.md"
-        if entity_candidate.exists():
-            rel = f"../entities/{link_slug}.md"
-        elif concept_candidate.exists():
-            rel = f"../concepts/{link_slug}.md"
-        elif section == "concepts":
-            rel = f"../concepts/{link_slug}.md"
+        candidates = []
+        if shared_scope != "global" and domain_slug:
+            candidates.extend([
+                WIKI_ROOT / domain_rel(domain_slug, "entities", f"{link_slug}.md"),
+                WIKI_ROOT / domain_rel(domain_slug, "concepts", f"{link_slug}.md"),
+            ])
+        candidates.extend([
+            WIKI_ROOT / "global" / "entities" / f"{link_slug}.md",
+            WIKI_ROOT / "global" / "concepts" / f"{link_slug}.md",
+        ])
+        existing_candidate = next((candidate for candidate in candidates if candidate.exists()), None)
+        if existing_candidate:
+            rel = os.path.relpath(existing_candidate, path.parent).replace(os.sep, "/")
+        elif link_slug in pending:
+            rel = f"../concepts/{link_slug}.md" if section == "concepts" else f"../entities/{link_slug}.md"
         else:
-            rel = f"../entities/{link_slug}.md"
+            link_lines.append(f"- {link}")
+            continue
         link_lines.append(f"- [{link}]({rel})")
-    links_md = "\n".join(link_lines) or f"- [{source_title}](../{source_page_rel})"
+    source_link = wiki_rel_link(rel_path, source_page_rel)
+    links_md = "\n".join(link_lines) or f"- [{source_title}]({source_link})"
 
     exists = path.exists()
     existing = path.read_text(encoding="utf-8") if exists else ""
@@ -2290,14 +2659,22 @@ def upsert_knowledge_page(section: str, item: dict[str, object], source_page_rel
             title=title,
             current_markdown=existing,
             source_title=source_title,
-            source_page_link=f"../{source_page_rel}",
+            source_page_link=source_link,
             source_summary=summary,
             facts=facts,
             links=links,
         )
-        path.write_text(repair_internal_links(rel_path, rewritten), encoding="utf-8")
+        path.write_text(repair_internal_links(rel_path, rewritten, pending), encoding="utf-8")
     else:
-        content = f"""# {title}
+        content = f"""---
+tags: [{section[:-1]}]
+domain: {domain_slug or "global"}
+shared_scope: {shared_scope}
+source_paths: ["{source_link}"]
+status: active
+---
+
+# {title}
 
 ## Summary
 
@@ -2309,7 +2686,7 @@ def upsert_knowledge_page(section: str, item: dict[str, object], source_page_rel
 
 ## Evidence / Notes
 
-- Updated from [{source_title}](../{source_page_rel}).
+- Updated from [{source_title}]({source_link}).
 
 ## Links
 
@@ -2317,7 +2694,7 @@ def upsert_knowledge_page(section: str, item: dict[str, object], source_page_rel
 
 ## Sources
 
-- [{source_title}](../{source_page_rel})
+- [{source_title}]({source_link})
 
 ## Open Questions
 
@@ -2325,31 +2702,33 @@ def upsert_knowledge_page(section: str, item: dict[str, object], source_page_rel
 """
         path.write_text(content, encoding="utf-8")
 
-    index_section = "Entities" if section == "entities" else "Concepts"
-    upsert_index_entry(index_section, rel_path, summary)
+    rebuild_index_page()
     return rel_path
 
 
-def update_overview_page(overview_update: str, source_page_rel: str, source_title: str) -> str:
-    overview_path = WIKI_ROOT / "overview.md"
+def update_overview_page(overview_update: str, source_page_rel: str, source_title: str, *, domain_slug: str = "") -> str:
+    domain_slug = ensure_domain(domain_slug or domain_from_rel_path(source_page_rel) or "unclassified")
+    overview_rel = domain_overview_rel(domain_slug)
+    overview_path = WIKI_ROOT / overview_rel
     existing = overview_path.read_text(encoding="utf-8") if overview_path.exists() else "# Overview\n"
     config = vertex_config()
+    source_link = wiki_rel_link(overview_rel, source_page_rel)
     if overview_path.exists() and config.configured:
         rewritten = vertex_rewrite_markdown_page(
             config,
             page_kind="overview",
-            title="Overview",
+            title=domain_title_from_slug(domain_slug),
             current_markdown=existing,
             source_title=source_title,
-            source_page_link=source_page_rel,
+            source_page_link=source_link,
             source_summary=overview_update.strip() or "Incremental update for the top-level synthesis.",
             facts=[overview_update.strip()] if overview_update.strip() else [],
             links=[],
         )
-        overview_path.write_text(repair_internal_links("overview.md", rewritten), encoding="utf-8")
+        overview_path.write_text(repair_internal_links(overview_rel, rewritten), encoding="utf-8")
     else:
         addition = (
-            f"\n### Update From {dt.date.today().isoformat()} · [{source_title}]({source_page_rel})\n\n"
+            f"\n### Update From {dt.date.today().isoformat()} · [{source_title}]({source_link})\n\n"
             f"{overview_update.strip() or 'This source contributed incremental updates to the wiki synthesis.'}\n"
         )
         if "## Evidence / Notes" in existing:
@@ -2357,19 +2736,38 @@ def update_overview_page(overview_update: str, source_page_rel: str, source_titl
         else:
             existing += "\n## Evidence / Notes\n" + addition
         overview_path.write_text(existing, encoding="utf-8")
-    upsert_index_entry("Overview", "overview.md", "Top-level synthesis and current scope of the wiki.")
-    return "overview.md"
+    rebuild_root_overview()
+    rebuild_index_page()
+    return overview_rel
 
 
-def write_revision_manifest(raw_relative_path: str, source_page_rel: str, touched_pages: list[str], source_data: dict[str, object]) -> str:
+def write_revision_manifest(
+    raw_relative_path: str,
+    source_page_rel: str,
+    touched_pages: list[str],
+    source_data: dict[str, object],
+    *,
+    domain_meta: dict[str, object] | None = None,
+    staged_pages: list[str] | None = None,
+) -> str:
     revision_id = f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{slugify(Path(raw_relative_path).stem)}"
     path = REVISIONS_ROOT / f"{revision_id}.json"
+    domain_meta = domain_meta or {}
+    domain_slug = str(domain_meta.get("domain_slug", "")).strip()
     manifest = {
         "id": revision_id,
         "created_at": dt.datetime.now().isoformat(timespec="seconds"),
         "raw_source": raw_relative_path,
         "source_page": source_page_rel,
         "touched_pages": touched_pages,
+        "domain": domain_slug,
+        "domain_confidence": domain_meta.get("confidence", ""),
+        "domain_reason": domain_meta.get("reason", ""),
+        "new_domain_created": bool(domain_meta.get("new_domain", False)),
+        "domain_pages_touched": [page for page in touched_pages if domain_slug and page.startswith(f"domains/{domain_slug}/")],
+        "global_pages_touched": [page for page in touched_pages if page.startswith("global/")],
+        "staged_pages": staged_pages or [page for page in touched_pages if page.startswith("staging/")],
+        "archived_pages": [page for page in touched_pages if page.startswith("archive/")],
         "summary": str(source_data.get("summary", "")).strip(),
         "key_points": sanitize_list(source_data.get("key_points", [])),
         "entities": [item["name"] for item in sanitize_page_items(source_data.get("entities", []))],
@@ -2411,6 +2809,41 @@ def ingest_raw_file(raw_relative_path: str) -> str:
         log_event("ingest:staged", f"{raw_relative_path} -> {staging_page_rel} | unusable extraction")
         return staging_page_rel
 
+    domain_meta = vertex_classify_source_domain(
+        config,
+        title=source_title,
+        raw_path=target,
+        raw_text=raw_text,
+        source_profile=source_profile,
+    )
+    if float(domain_meta.get("confidence", 0.0) or 0.0) < DOMAIN_CONFIDENCE_THRESHOLD or not str(domain_meta.get("domain_slug", "")).strip():
+        source_profile = {**source_profile, "decision": "domain-review"}
+        staging_page_rel = write_staging_source_page(
+            target.relative_to(RAW_ROOT).as_posix(),
+            source_profile=source_profile,
+            domain_meta=domain_meta,
+            domain_review=True,
+        )
+        append_log(
+            "stage",
+            source_title,
+            f"Held {raw_relative_path} for domain review because classification confidence was {domain_meta.get('confidence', 0)}.",
+            [staging_page_rel],
+        )
+        log_event("ingest:domain-review", f"{raw_relative_path} -> {staging_page_rel} | confidence={domain_meta.get('confidence', 0)}")
+        return staging_page_rel
+
+    domain_slug = ensure_domain(
+        str(domain_meta.get("domain_slug", "")),
+        str(domain_meta.get("domain_title", "")),
+        str(domain_meta.get("reason", "")),
+    )
+    domain_meta["domain_slug"] = domain_slug
+
+    all_pages = scan_wiki_pages()
+    existing_entities = [p.title for p in all_pages if p.kind == "entity" and p.domain in {domain_slug, "global"}]
+    existing_concepts = [p.title for p in all_pages if p.kind == "concept" and p.domain in {domain_slug, "global"}]
+
     source_data = vertex_generate_structured_summary(
         config=config,
         title=source_title,
@@ -2418,11 +2851,14 @@ def ingest_raw_file(raw_relative_path: str) -> str:
         raw_text=raw_text,
         workbook_info=workbook_info,
         source_profile=source_profile,
+        existing_entities=existing_entities,
+        existing_concepts=existing_concepts,
     )
     staging_page_rel = write_staging_source_page(
         target.relative_to(RAW_ROOT).as_posix(),
         source_profile=source_profile,
         source_data=source_data,
+        domain_meta=domain_meta,
     )
 
     if not should_promote_source(source_profile):
@@ -2438,6 +2874,8 @@ def ingest_raw_file(raw_relative_path: str) -> str:
     source_page_rel = write_ai_source_page(
         target.relative_to(RAW_ROOT).as_posix(),
         source_data,
+        domain_slug=domain_slug,
+        domain_meta=domain_meta,
         source_profile=source_profile,
         staging_page_rel=staging_page_rel,
     )
@@ -2445,6 +2883,7 @@ def ingest_raw_file(raw_relative_path: str) -> str:
         target.relative_to(RAW_ROOT).as_posix(),
         source_profile=source_profile,
         source_data=source_data,
+        domain_meta=domain_meta,
         promoted_page_rel=source_page_rel,
     )
     touched_pages = [staging_page_rel, source_page_rel]
@@ -2455,12 +2894,15 @@ def ingest_raw_file(raw_relative_path: str) -> str:
             source_title,
             workbook_info,
             source_data,
+            domain_slug=domain_slug,
         )
         if sheet_pages:
             touched_pages.extend(sheet_pages)
             source_page_rel = write_ai_source_page(
                 target.relative_to(RAW_ROOT).as_posix(),
                 source_data,
+                domain_slug=domain_slug,
+                domain_meta=domain_meta,
                 sheet_page_links=sheet_pages,
                 source_profile=source_profile,
                 staging_page_rel=staging_page_rel,
@@ -2470,18 +2912,21 @@ def ingest_raw_file(raw_relative_path: str) -> str:
                 target.relative_to(RAW_ROOT).as_posix(),
                 source_profile=source_profile,
                 source_data=source_data,
+                domain_meta=domain_meta,
                 promoted_page_rel=source_page_rel,
             )
             touched_pages[0] = staging_page_rel
 
-    for entity in sanitize_page_items(source_data.get("entities", [])):
-        touched_pages.append(upsert_knowledge_page("entities", entity, source_page_rel, source_title))
-    for concept in sanitize_page_items(source_data.get("concepts", [])):
-        touched_pages.append(upsert_knowledge_page("concepts", concept, source_page_rel, source_title))
+    pending_slugs = {slugify(str(item["name"])) for item in sanitize_page_items(source_data.get("entities", [])) + sanitize_page_items(source_data.get("concepts", []))}
 
-    touched_pages.append(update_overview_page(str(source_data.get("overview_update", "")).strip(), source_page_rel, source_title))
+    for entity in sanitize_page_items(source_data.get("entities", [])):
+        touched_pages.append(upsert_knowledge_page("entities", entity, source_page_rel, source_title, pending_slugs, domain_slug=domain_slug))
+    for concept in sanitize_page_items(source_data.get("concepts", [])):
+        touched_pages.append(upsert_knowledge_page("concepts", concept, source_page_rel, source_title, pending_slugs, domain_slug=domain_slug))
+
+    touched_pages.append(update_overview_page(str(source_data.get("overview_update", "")).strip(), source_page_rel, source_title, domain_slug=domain_slug))
     touched_pages.append("index.md")
-    revision_id = write_revision_manifest(raw_relative_path, source_page_rel, sorted(set(touched_pages)), source_data)
+    revision_id = write_revision_manifest(raw_relative_path, source_page_rel, sorted(set(touched_pages)), source_data, domain_meta=domain_meta)
     append_log(
         "ingest",
         source_title,
@@ -3142,14 +3587,31 @@ def tokenize(text: str) -> list[str]:
 
 def select_relevant_wiki_pages(question: str, limit: int = 6) -> list[Page]:
     tokens = tokenize(question)
+    index_text = INDEX_PATH.read_text(encoding="utf-8").lower() if INDEX_PATH.exists() else ""
+    domain_scores: dict[str, int] = {}
+    for domain in scan_domains():
+        haystack = f"{domain['slug']} {domain['title']} {domain['summary']}".lower()
+        score = sum(haystack.count(token) for token in tokens)
+        if score:
+            domain_scores[domain["slug"]] = score
     scored: list[tuple[int, Page]] = []
     for page in scan_wiki_pages():
         text = read_text_file(page.path).lower()
         score = sum(text.count(token) for token in tokens)
+        if page.domain in domain_scores:
+            score += domain_scores[page.domain] * 3
+        if page.rel_path.lower() in index_text:
+            score += 1
         if score > 0:
             scored.append((score, page))
     scored.sort(key=lambda item: (-item[0], item[1].rel_path))
-    return [page for _, page in scored[:limit]]
+    selected = [page for _, page in scored[:limit]]
+    linked_globals: list[Page] = []
+    selected_text = "\n".join(read_text_file(page.path) for page in selected)
+    for page in scan_wiki_pages():
+        if page.domain == "global" and page.rel_path in selected_text and page not in selected:
+            linked_globals.append(page)
+    return (selected + linked_globals)[:limit]
 
 
 def normalize_assistant_action(message: str) -> str:
@@ -3550,6 +4012,17 @@ def vertex_answer_query(config: VertexConfig, question: str, pages: list[Page]) 
     return parse_vertex_json_text(text)
 
 
+def dominant_query_domain(pages: list[Page]) -> str:
+    counts: dict[str, int] = {}
+    for page in pages:
+        if page.domain and page.domain != "global":
+            counts[page.domain] = counts.get(page.domain, 0) + 1
+    if not counts:
+        return ""
+    domain, count = sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0]
+    return domain if count >= max(2, len(pages) // 2) else ""
+
+
 def vertex_review_wiki(config: VertexConfig, pages: list[Page]) -> dict[str, object]:
     context_blocks = []
     for page in pages[:18]:
@@ -3693,16 +4166,30 @@ def vertex_plan_assistant_actions(config: VertexConfig, message: str, pages: lis
 def write_query_page(question: str, result: dict[str, object], pages: list[Page]) -> str:
     title = str(result.get("title", "")).strip() or question[:80]
     slug = slugify(title)
-    rel_path = f"queries/{slug}.md"
+    query_domain = dominant_query_domain(pages)
+    if query_domain:
+        ensure_domain(query_domain)
+        rel_path = domain_rel(query_domain, "queries", f"{slug}.md")
+    else:
+        rel_path = f"queries/{slug}.md"
     path = WIKI_ROOT / rel_path
+    path.parent.mkdir(parents=True, exist_ok=True)
     summary = str(result.get("summary", "")).strip() or "AI-generated query artifact."
     answer_md = str(result.get("answer_md", "")).strip() or "No answer generated."
     related_pages = sanitize_list(result.get("related_pages", [])) or [page.rel_path for page in pages]
     follow_ups = sanitize_list(result.get("follow_up_questions", []))
-    related_md = "\n".join(f"- [{page}]({('../' + page) if not page.startswith('../') else page})" for page in related_pages)
+    related_md = "\n".join(f"- [{page}]({wiki_rel_link(rel_path, page) if not page.startswith('../') else page})" for page in related_pages)
     follow_md = "\n".join(f"- {item}" for item in follow_ups) or "- None yet."
 
-    content = f"""# {title}
+    content = f"""---
+tags: [query]
+domain: {query_domain or "cross-domain"}
+shared_scope: {"domain" if query_domain else "global"}
+source_paths: [{", ".join(json.dumps(page) for page in related_pages[:12])}]
+status: active
+---
+
+# {title}
 
 ## Summary
 
@@ -3725,7 +4212,7 @@ def write_query_page(question: str, result: dict[str, object], pages: list[Page]
 {follow_md}
 """
     path.write_text(content, encoding="utf-8")
-    upsert_index_entry("Queries", rel_path, summary)
+    rebuild_index_page()
     append_log("query", title, f"Filed a query artifact for: {question}", [rel_path] + related_pages[:4])
     return rel_path
 
@@ -3902,7 +4389,7 @@ def extract_internal_links(text: str) -> list[str]:
 
 
 def run_lint_pass() -> dict[str, object]:
-    pages = scan_wiki_pages()
+    pages = [page for page in scan_wiki_pages() if not page.rel_path.endswith("/README.md")]
     page_map = {page.rel_path: page for page in pages}
     inbound: dict[str, int] = {page.rel_path: 0 for page in pages}
     broken_links: list[str] = []
@@ -3925,11 +4412,30 @@ def run_lint_pass() -> dict[str, object]:
         rel_path for rel_path, count in inbound.items()
         if count == 0 and rel_path not in {"overview.md"} and not rel_path.startswith("queries/")
     ]
+    flat_pages = [
+        page.rel_path for page in pages
+        if page.rel_path.startswith(("sources/", "entities/", "concepts/"))
+    ]
+    low_value_pages = []
+    title_to_paths: dict[str, list[str]] = {}
+    for page in pages:
+        if page.kind in {"concept", "entity"}:
+            title_to_paths.setdefault(slugify(page.title), []).append(page.rel_path)
+            text = read_text_file(page.path)
+            if count_page_sources(text) <= 1 and len(text.split()) < 90:
+                low_value_pages.append(page.rel_path)
+    duplicated = {
+        title: paths for title, paths in title_to_paths.items()
+        if len(paths) > 1
+    }
     report = {
         "broken_links": sorted(set(broken_links)),
         "orphans": sorted(orphans),
+        "flat_pages": sorted(flat_pages),
+        "low_value_pages": sorted(low_value_pages),
+        "duplicated_entities_or_concepts": duplicated,
         "pages_scanned": len(pages),
-        "summary": f"Scanned {len(pages)} wiki pages, found {len(set(broken_links))} broken links and {len(orphans)} orphan pages.",
+        "summary": f"Scanned {len(pages)} wiki pages, found {len(set(broken_links))} broken links, {len(orphans)} orphan pages, {len(flat_pages)} old flat pages, and {len(low_value_pages)} low-value pages.",
     }
     return report
 
@@ -3940,8 +4446,17 @@ def write_lint_report(report: dict[str, object]) -> str:
     path = WIKI_ROOT / rel_path
     broken = sanitize_list(report.get("broken_links", []))
     orphans = sanitize_list(report.get("orphans", []))
+    flat_pages = sanitize_list(report.get("flat_pages", []))
+    low_value = sanitize_list(report.get("low_value_pages", []))
+    duplicates = report.get("duplicated_entities_or_concepts", {})
     broken_md = "\n".join(f"- {item}" for item in broken) or "- None."
     orphan_md = "\n".join(f"- [{item}](../{item})" for item in orphans) or "- None."
+    flat_md = "\n".join(f"- [{item}](../{item})" for item in flat_pages) or "- None."
+    low_value_md = "\n".join(f"- [{item}](../{item})" for item in low_value) or "- None."
+    duplicate_md = "\n".join(
+        f"- {title}: {', '.join(paths)}"
+        for title, paths in duplicates.items()
+    ) if isinstance(duplicates, dict) and duplicates else "- None."
     content = f"""# Lint Report {timestamp}
 
 ## Summary
@@ -3956,9 +4471,21 @@ def write_lint_report(report: dict[str, object]) -> str:
 
 {orphan_md}
 
+## Old Flat Pages
+
+{flat_md}
+
+## Low-Value Pages
+
+{low_value_md}
+
+## Duplicated Entities Or Concepts
+
+{duplicate_md}
+
 ## Notes
 
-- This first lint pass checks internal markdown links and inbound-link counts.
+- This lint pass checks internal links, inbound-link counts, old flat namespace pages, thin generated pages, and duplicated concept/entity titles across domains.
 """
     path.write_text(content, encoding="utf-8")
     upsert_index_entry("Queries", rel_path, str(report.get("summary", "")).strip() or "Wiki lint report.")
@@ -4259,18 +4786,18 @@ def page_shell(*, title: str, body: str, pages: list[Page], flash: str = "") -> 
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{html.escape(title)} | LLM Wiki</title>
+  <title>{html.escape(title)} | Solo-Corp OS</title>
   <style>{STYLE}</style>
 </head>
 <body>
   <div class="layout">
     <aside class="sidebar">
       <div class="brand">
-        <h1>LLM Wiki</h1>
-        <p>The free AI-maintained encyclopedia</p>
+        <h1>Solo-Corp OS</h1>
+        <p>The Co-Founder Brain</p>
       </div>
       <form class="search-form" method="get" action="/search">
-        <input type="search" name="q" placeholder="Search LLM Wiki">
+        <input type="search" name="q" placeholder="Search the OS">
         <button type="submit">Search</button>
       </form>
       <div class="nav-meta">AI pages: {stats['wiki_pages']} · Raw uploads: {stats['raw_files']}</div>
@@ -4284,11 +4811,22 @@ def page_shell(*, title: str, body: str, pages: list[Page], flash: str = "") -> 
         <ul>
           <li><a href="/">Main page</a></li>
           <li><a href="/page/index.md">Wiki index</a></li>
+          <li><a href="/graph">Graph View</a></li>
           <li><a href="/page/log.md">Activity log</a></li>
           <li><a href="/revisions">Revisions</a></li>
           <li><a href="/queries">Queries</a></li>
           <li><a href="/staging">Staging</a></li>
           <li><a href="/batches">Batches</a></li>
+          <li>
+            <form action="/reset-wiki" method="post" style="display:inline;">
+              <button type="submit" style="background:none;border:none;color:var(--link);padding:0;font:inherit;cursor:pointer;text-decoration:none;" onclick="return confirm('Are you sure you want to reset the wiki? This deletes all generated pages (sources, entities, concepts) but keeps raw files.');">Reset Wiki</button>
+            </form>
+          </li>
+          <li>
+            <form action="/ingest-all" method="post" style="display:inline;">
+              <button type="submit" style="background:none;border:none;color:var(--link);padding:0;font:inherit;cursor:pointer;text-decoration:none;" onclick="return confirm('Are you sure you want to reingest all raw files? This will queue them for background processing.');">Reingest All</button>
+            </form>
+          </li>
         </ul>
       </section>
     </aside>
@@ -4500,6 +5038,21 @@ class WikiHandler(BaseHTTPRequestHandler):
         if parsed.path == "/status":
             self.write_json(read_status())
             return
+        if parsed.path.startswith("/v1/models"):
+            self.handle_v1_models()
+            return
+        if parsed.path == "/openapi.json":
+            self.handle_openapi_json()
+            return
+        if parsed.path == "/docs":
+            self.render_swagger()
+            return
+        if parsed.path == "/api/graph":
+            self.handle_graph_api()
+            return
+        if parsed.path == "/graph":
+            self.render_graph()
+            return
         if parsed.path == "/chat-state":
             self.write_json({"messages_html": render_chat_messages_html(list_chat_messages())})
             return
@@ -4537,6 +5090,9 @@ class WikiHandler(BaseHTTPRequestHandler):
         if parsed.path == "/upload":
             self.handle_upload()
             return
+        if parsed.path.startswith("/v1/chat/completions") or parsed.path.startswith("/v1/responses"):
+            self.handle_v1_chat_completions()
+            return
         if parsed.path == "/query":
             self.handle_query()
             return
@@ -4564,7 +5120,461 @@ class WikiHandler(BaseHTTPRequestHandler):
         if parsed.path == "/ingest":
             self.handle_ingest()
             return
+        if parsed.path == "/reset-wiki":
+            self.handle_reset_wiki()
+            return
+        if parsed.path == "/ingest-all":
+            self.handle_ingest_all()
+            return
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
+
+    def handle_graph_api(self) -> None:
+        pages = scan_wiki_pages()
+        nodes = []
+        edges = []
+        
+        # Build node map to ensure edges connect valid nodes
+        page_paths = {page.rel_path for page in pages}
+        
+        for page in pages:
+            # Determine group
+            group = "other"
+            if page.rel_path.startswith("domains/"):
+                parts = page.rel_path.split("/")
+                if len(parts) > 1:
+                    group = parts[1]
+            elif page.rel_path.startswith("global/"):
+                group = "global"
+            elif page.rel_path.startswith("entities/"):
+                group = "entity"
+            elif page.rel_path.startswith("concepts/"):
+                group = "concept"
+            elif page.rel_path.startswith("sources/"):
+                group = "source"
+                
+            nodes.append({
+                "id": page.rel_path,
+                "label": page.title or page.path.name,
+                "group": group,
+                "title": f"Path: {page.rel_path}\\nSummary: {page.summary}"
+            })
+            
+            # Extract links
+            content = read_text_file(page.path)
+            # Find markdown links: [text](link)
+            link_pattern = re.compile(r'\[.*?\]\((.*?)\)')
+            for match in link_pattern.finditer(content):
+                link = match.group(1)
+                # Cleanup link to match rel_path
+                link = unquote(link).split('#')[0]
+                if link.startswith('file://'):
+                    continue # Skip absolute file links or external links
+                if link.startswith('http'):
+                    continue
+                # Normalize relative links
+                if link.startswith('/'):
+                    link = link[1:]
+                else:
+                    link = posixpath.normpath(posixpath.join(posixpath.dirname(page.rel_path), link))
+                
+                if link in page_paths:
+                    edges.append({
+                        "from": page.rel_path,
+                        "to": link
+                    })
+                    
+        self.write_json({"nodes": nodes, "edges": edges})
+
+    def render_graph(self) -> None:
+        pages = scan_wiki_pages()
+        html_content = page_shell(
+            title="Graph View",
+            body="""
+            <div class="topbar">
+                <div class="wordmark">
+                    <div class="wordmark-mark">S</div>
+                    <div class="wordmark-text">
+                        <strong>Solo-Corp OS</strong>
+                        <span>Graph View</span>
+                    </div>
+                </div>
+            </div>
+            <div class="content-inner">
+                <h1 class="article-title">Knowledge Graph</h1>
+                <p class="subtitle">Interactive visualization of your wiki connections.</p>
+                <div class="article-body">
+                    <div id="mynetwork" style="width: 100%; height: 600px; border: 1px solid var(--border-light); background: #fafbfc; border-radius: 4px; margin-top: 16px;"></div>
+                </div>
+            </div>
+            
+            <!-- Vis-Network CDN -->
+            <script type="text/javascript" src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+            <script type="text/javascript">
+                document.addEventListener('DOMContentLoaded', function() {
+                    fetch('/api/graph')
+                        .then(response => response.json())
+                        .then(data => {
+                            var container = document.getElementById('mynetwork');
+                            var nodes = new vis.DataSet(data.nodes);
+                            var edges = new vis.DataSet(data.edges);
+                            var graphData = {
+                                nodes: nodes,
+                                edges: edges
+                            };
+                            var options = {
+                                nodes: {
+                                    shape: 'dot',
+                                    size: 16,
+                                    font: {
+                                        size: 14,
+                                        color: '#333'
+                                    },
+                                    borderWidth: 2
+                                },
+                                edges: {
+                                    width: 1.5,
+                                    color: { inherit: 'both' },
+                                    smooth: {
+                                        type: 'continuous'
+                                    }
+                                },
+                                physics: {
+                                    forceAtlas2Based: {
+                                        gravitationalConstant: -50,
+                                        centralGravity: 0.01,
+                                        springLength: 100,
+                                        springConstant: 0.08
+                                    },
+                                    maxVelocity: 50,
+                                    solver: 'forceAtlas2Based',
+                                    timestep: 0.35,
+                                    stabilization: { iterations: 150 }
+                                },
+                                interaction: {
+                                    hover: true,
+                                    tooltipDelay: 200,
+                                    zoomView: true
+                                }
+                            };
+                            var network = new vis.Network(container, graphData, options);
+                            
+                            // Double click opens the page
+                            network.on("doubleClick", function(params) {
+                                if (params.nodes.length > 0) {
+                                    window.location.href = "/page/" + params.nodes[0];
+                                }
+                            });
+                            
+                            // Click opens the page
+                            network.on("selectNode", function(params) {
+                                if (params.nodes.length > 0) {
+                                    window.location.href = "/page/" + params.nodes[0];
+                                }
+                            });
+                        })
+                        .catch(error => {
+                            console.error('Error fetching graph data:', error);
+                            document.getElementById('mynetwork').innerHTML = '<div style="padding: 20px; color: red;">Failed to load graph data. Check console for details.</div>';
+                        });
+                });
+            </script>
+            """,
+            pages=pages,
+        )
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(html_content.encode("utf-8"))))
+        self.end_headers()
+        self.wfile.write(html_content.encode("utf-8"))
+
+    def handle_openapi_json(self) -> None:
+        openapi = {
+            "openapi": "3.0.0",
+            "info": {
+                "title": "Solo-Corp OS API",
+                "version": "1.0.0"
+            },
+            "paths": {
+                "/v1/chat/completions": {
+                    "post": {
+                        "summary": "Create chat completion",
+                        "requestBody": {
+                            "required": True,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "messages": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "role": {"type": "string"},
+                                                        "content": {"type": "string"}
+                                                    }
+                                                }
+                                            },
+                                            "stream": {"type": "boolean"}
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {
+                            "200": {
+                                "description": "Successful response"
+                            }
+                        }
+                    }
+                },
+                "/v1/models": {
+                    "get": {
+                        "summary": "List models",
+                        "responses": {
+                            "200": {
+                                "description": "Successful response"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.write_json(openapi)
+
+    def render_swagger(self) -> None:
+        html = """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+          <meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <title>Swagger UI - Solo-Corp OS</title>
+          <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui.css" />
+        </head>
+        <body>
+        <div id="swagger-ui"></div>
+        <script src="https://unpkg.com/swagger-ui-dist@5.11.0/swagger-ui-bundle.js" crossorigin></script>
+        <script>
+          window.onload = () => {
+            window.ui = SwaggerUIBundle({
+              url: '/openapi.json',
+              dom_id: '#swagger-ui',
+            });
+          };
+        </script>
+        </body>
+        </html>
+        """
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(html.encode("utf-8"))))
+        self.end_headers()
+        self.wfile.write(html.encode("utf-8"))
+
+    def handle_v1_models(self) -> None:
+        self.write_json({
+            "object": "list",
+            "data": [
+                {
+                    "id": "solo-corp-brain",
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "solo-corp-os"
+                }
+            ]
+        })
+
+    def handle_v1_chat_completions(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length == 0:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Empty body")
+            return
+        raw_body = self.rfile.read(length).decode("utf-8")
+        try:
+            req = json.loads(raw_body)
+        except json.JSONDecodeError:
+            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid JSON")
+            return
+            
+        messages = req.get("messages", [])
+        if not messages:
+            self.send_error(HTTPStatus.BAD_REQUEST, "No messages provided")
+            return
+            
+        question = messages[-1].get("content", "")
+        
+        config = vertex_config()
+        if not config.configured:
+            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, "Vertex AI not configured")
+            return
+            
+        pages = select_relevant_wiki_pages(question)
+        if not pages:
+            answer = "I don't have any relevant knowledge in my OS yet to answer this. Please ingest more sources first."
+        else:
+            try:
+                result = vertex_answer_query(config, question, pages)
+                answer = result.get("answer_md", "Error generating answer.")
+                
+                # Format sources nicely
+                if result.get("related_pages"):
+                    sources = "\\n\\n**Sources:**\\n" + "\\n".join(f"- {p}" for p in result.get("related_pages", []))
+                    answer += sources
+            except Exception as e:
+                answer = f"Error generating answer: {str(e)}"
+                
+        # Handle streaming
+        stream = req.get("stream", False)
+        
+        if stream:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            
+            chat_id = f"chatcmpl-{int(time.time())}"
+            created_time = int(time.time())
+            
+            # Send the initial role chunk
+            chunk_role = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": "solo-corp-brain",
+                "choices": [{"delta": {"role": "assistant", "content": ""}, "index": 0, "finish_reason": None}]
+            }
+            self.wfile.write(f"data: {json.dumps(chunk_role)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+            
+            # Artificially stream the answer in small pieces to perfectly match OpenAI behavior
+            chunk_size = 20
+            for i in range(0, len(answer), chunk_size):
+                piece = answer[i:i+chunk_size]
+                chunk_content = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": "solo-corp-brain",
+                    "choices": [{"delta": {"content": piece}, "index": 0, "finish_reason": None}]
+                }
+                self.wfile.write(f"data: {json.dumps(chunk_content)}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                time.sleep(0.01)
+            
+            # Send the finish_reason chunk
+            chunk_finish = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": "solo-corp-brain",
+                "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}]
+            }
+            self.wfile.write(f"data: {json.dumps(chunk_finish)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+            
+            # Send the DONE indicator
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        else:
+            resp = {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": "solo-corp-brain",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": answer
+                    },
+                    "finish_reason": "stop",
+                    "index": 0
+                }]
+            }
+            self.write_json(resp)
+
+    def handle_reset_wiki(self) -> None:
+        paths_to_clear = [
+            WIKI_ROOT / "sources",
+            WIKI_ROOT / "entities",
+            WIKI_ROOT / "concepts",
+            WIKI_ROOT / "queries",
+            WIKI_ROOT / "archive",
+            WIKI_ROOT / "revisions",
+            WIKI_ROOT / "staging" / "sources",
+        ]
+        for p in paths_to_clear:
+            if p.exists() and p.is_dir():
+                shutil.rmtree(p)
+        for p in [WIKI_ROOT / "index.md", WIKI_ROOT / "log.md", WIKI_ROOT / "overview.md"]:
+            if p.exists():
+                p.unlink()
+        initialize_workspace_files(CURRENT_WORKSPACE)
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", "/")
+        self.end_headers()
+
+    def handle_ingest_all(self) -> None:
+        raw_files = scan_raw_files()
+        paths_to_ingest: list[Path] = []
+        for page in raw_files:
+            if should_ingest_path(page.path) and (
+                page.path.suffix.lower() not in {".pdf", ".xlsx", ".xls", ".json"} or bool(read_text_file(page.path, for_ingest=True).strip())
+            ):
+                paths_to_ingest.append(page.path)
+
+        if not paths_to_ingest:
+            self.redirect("/?flash=No+raw+files+to+ingest")
+            return
+
+        batch_id = start_batch_status(len(paths_to_ingest))
+        
+        batch_payload = {
+            "id": batch_id,
+            "job_type": "ingest",
+            "status": "queued",
+            "phase": "queued",
+            "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "workspace": CURRENT_WORKSPACE,
+            "started_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "completed_at": "",
+            "saved_count": len(paths_to_ingest),
+            "total_items": len(paths_to_ingest),
+            "ingest_total": len(paths_to_ingest),
+            "ingest_completed": 0,
+            "failure_count": 0,
+            "saved_paths": [path.relative_to(RAW_ROOT).as_posix() for path in paths_to_ingest],
+            "text_paths": [path.relative_to(RAW_ROOT).as_posix() for path in paths_to_ingest],
+            "skipped_paths": [],
+            "current_file": "",
+            "successes": [],
+            "failures": [],
+            "maintenance_report": "",
+            "revisions_created": 0,
+        }
+        write_batch(batch_id, batch_payload)
+        INGEST_QUEUE.put(batch_payload)
+        update_status(
+            batch_id=batch_id,
+            active=True,
+            job_type="ingest",
+            job_label=batch_job_label("ingest"),
+            phase="queued",
+            saved_count=len(paths_to_ingest),
+            total_items=len(paths_to_ingest),
+            ingest_total=len(paths_to_ingest),
+            ingest_completed=0,
+            failure_count=0,
+            current_file="",
+            current_step="Queued for background ingest",
+            queue_depth=INGEST_QUEUE.qsize(),
+            last_event=f"Queued {len(paths_to_ingest)} files for reingestion"
+        )
+        ensure_worker()
+        flash = f"Queued {len(paths_to_ingest)} files for background reingestion."
+        log_event("ingest-all:queued", f"total={len(paths_to_ingest)} | batch={batch_id}")
+        self.redirect(f"/?flash={quote(flash)}")
 
     def render_home(self, query: dict[str, list[str]]) -> None:
         pages = scan_wiki_pages()
@@ -4607,8 +5617,8 @@ class WikiHandler(BaseHTTPRequestHandler):
         </div>
         <div class="shell">
           <article class="page">
-            <h1 class="article-title">LLM Wiki</h1>
-            <p class="subtitle">From today’s uploads to long-running concepts, this wiki is maintained as an accumulating encyclopedia rather than a temporary chat answer.</p>
+            <h1 class="article-title">Solo-Corp OS</h1>
+            <p class="subtitle">From today’s uploads to long-running concepts, this wiki is maintained as the Co-Founder Brain rather than a temporary chat answer.</p>
             <div class="status-box" data-ingestion-status>
               <h2>Ingestion Status</h2>
               <div class="status-grid">
@@ -4642,7 +5652,7 @@ class WikiHandler(BaseHTTPRequestHandler):
                 <span class="chip">entities</span>
                 <span class="chip">concepts</span>
                 <span class="chip">query artifacts</span>
-                <p><b>LLM Wiki</b> is a locally hosted encyclopedia where raw uploads live in <span class="mono">raw/</span> and curated knowledge lives in <span class="mono">wiki/</span>. Each ingest can revise multiple related pages and leave a revision record behind.</p>
+                <p><b>Solo-Corp OS</b> is a locally hosted Co-Founder Brain where raw uploads live in <span class="mono">raw/</span> and curated knowledge lives in <span class="mono">wiki/</span>. Each ingest can revise multiple related pages and leave a revision record behind.</p>
               </section>
               <section class="section-card">
                 <h2>Recently Updated Pages</h2>

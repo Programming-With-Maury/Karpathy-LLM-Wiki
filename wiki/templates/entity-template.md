@@ -1,3 +1,13 @@
+---
+tags: [entity]
+aliases: []
+date_created: {{date}}
+domain: ""
+shared_scope: domain
+source_paths: []
+status: active
+---
+
 # Entity Name
 
 ## Summary

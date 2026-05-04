@@ -11,7 +11,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 RAW_SOURCES = ROOT / "raw" / "sources"
-WIKI_SOURCES = ROOT / "wiki" / "sources"
+WIKI_ROOT = ROOT / "wiki"
+DOMAINS_ROOT = WIKI_ROOT / "domains"
 INDEX_PATH = ROOT / "wiki" / "index.md"
 LOG_PATH = ROOT / "wiki" / "log.md"
 
@@ -25,8 +26,18 @@ def today() -> str:
     return dt.date.today().isoformat()
 
 
-def source_stub(title: str, raw_name: str) -> str:
-    return f"""# {title}
+def source_stub(title: str, raw_name: str, domain: str) -> str:
+    return f"""---
+tags: [source]
+domain: {domain}
+domain_confidence: manual
+domain_reason: "Created from the helper CLI."
+shared_scope: domain
+source_paths: ["../../../../raw/sources/{raw_name}"]
+status: staged
+---
+
+# {title}
 
 ## Summary
 
@@ -34,7 +45,8 @@ Pending ingest.
 
 ## Source Metadata
 
-- Raw path: ../../raw/sources/{raw_name}
+- Raw path: ../../../../raw/sources/{raw_name}
+- Domain: {domain}
 - Author:
 - Published:
 - Ingested: {today()}
@@ -65,16 +77,31 @@ Pending ingest.
 """
 
 
-def init_source(title: str) -> None:
+def ensure_domain(domain: str) -> Path:
+    root = DOMAINS_ROOT / slugify(domain)
+    for section in ["sources", "entities", "concepts", "queries"]:
+        (root / section).mkdir(parents=True, exist_ok=True)
+    overview = root / "overview.md"
+    if not overview.exists():
+        overview.write_text(
+            f"---\ntags: [domain]\ndomain: {slugify(domain)}\nstatus: active\n---\n\n"
+            f"# {domain.strip().title()}\n\n## Summary\n\nDomain workspace for {domain.strip().title()}.\n",
+            encoding="utf-8",
+        )
+    return root
+
+
+def init_source(title: str, domain: str) -> None:
     slug = slugify(title)
+    domain_slug = slugify(domain)
     raw_path = RAW_SOURCES / f"{slug}.md"
-    wiki_path = WIKI_SOURCES / f"{slug}.md"
+    wiki_path = ensure_domain(domain_slug) / "sources" / f"{slug}.md"
 
     if not raw_path.exists():
         raw_path.write_text(f"# {title}\n\nAdd raw source material here.\n", encoding="utf-8")
 
     if not wiki_path.exists():
-        wiki_path.write_text(source_stub(title, raw_path.name), encoding="utf-8")
+        wiki_path.write_text(source_stub(title, raw_path.name, domain_slug), encoding="utf-8")
 
     print(f"Raw source: {raw_path.relative_to(ROOT)}")
     print(f"Wiki page: {wiki_path.relative_to(ROOT)}")
@@ -99,6 +126,7 @@ def parse_args() -> argparse.Namespace:
 
     init_parser = subparsers.add_parser("init-source", help="Create a raw source stub and wiki source page")
     init_parser.add_argument("title", help="Human-readable source title")
+    init_parser.add_argument("--domain", default="unclassified", help="Domain slug/title for the source stub")
 
     log_parser = subparsers.add_parser("add-log", help="Append an entry to wiki/log.md")
     log_parser.add_argument("operation", help="Operation name: ingest, query, lint, etc.")
@@ -112,7 +140,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.command == "init-source":
-        init_source(args.title)
+        init_source(args.title, args.domain)
         return
     if args.command == "add-log":
         add_log_entry(args.operation, args.title, args.summary, args.page)

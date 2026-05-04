@@ -1,4 +1,9 @@
 .env
+*.py[cod]
+__pycache__/
+**/__pycache__/
+.DS_Store
+**/.DS_Store
 .notion-sync-state.json
 **/.notion-sync-state.json
 notion-sync.config.json
@@ -40,3 +45,7 @@ wiki/queries/**
 *.pdf
 *.xlsx
 *.xls
+wiki/**
+!wiki/
+!wiki/templates/
+!wiki/templates/*.md

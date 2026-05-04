@@ -1,3 +1,16 @@
+---
+tags: [source]
+date_ingested: {{date}}
+source_url: ""
+author: ""
+domain: ""
+domain_confidence: ""
+domain_reason: ""
+shared_scope: domain
+source_paths: []
+status: active
+---
+
 # Source Title
 
 ## Summary
@@ -14,6 +27,14 @@ One paragraph summary of the source.
 ## Key Points
 
 - Point
+
+## Business / Technical Decisions
+
+- What architectural or business decisions were made in this source?
+
+## Action Items
+
+- [ ] Task to execute based on this source.
 
 ## Evidence / Notes
 
